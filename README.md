@@ -105,6 +105,13 @@ DSH_IM_PKG_DIR="$HOME/.dsh/profiles/web/node_modules/@xmanrui/dsh-im" node build
 
 完整 diff 见 `patches/dsh-im-5.0.2.patch`。
 
+## 常见问题
+
+- **发文件/文字返回 502 / iLink `{"ret":-2,"errmsg":"prepare failed"}`**：这是微信侧限制——连续主动发送约 10 条后会被拒绝，
+  让用户先给机器人发一条消息即可恢复。上游讨论：<https://github.com/xmanrui/dsh-im/issues/151>。
+- **`/hold` 不生效**：确认已重启 `dsh web`，且安装的 bundle 校验和与本仓库 `dist/SHA256SUMS` 一致。
+- **`pnpm install` 后补丁消失**：重跑 `apply.sh`，或按 README 在 profile 里加 `postinstall` 钩子。
+
 ## 安全
 
 - 文件接口**没有鉴权、也没有 CORS**，只应在本机使用；
