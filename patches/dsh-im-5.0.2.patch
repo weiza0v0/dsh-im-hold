@@ -1031,15 +1031,15 @@ index 92234f8..7f7a2f6 100644
      });
    }
 diff --git a/src/channels/shared/command-catalog.mjs b/src/channels/shared/command-catalog.mjs
-index fa335e8..bc7cc29 100644
+index fa335e8..f7f34c2 100644
 --- a/src/channels/shared/command-catalog.mjs
 +++ b/src/channels/shared/command-catalog.mjs
 @@ -26,6 +26,9 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
    defineCatalogCommand('new', '开启一个全新会话', [
      '/new  开启一个全新会话',
    ]),
-+  defineCatalogCommand('reset', '重置当前会话（本地命令，不调用模型）', [
-+    '/reset  重置会话与上下文；IM 端发送它也会重新激活被风控的推送窗口',
++  defineCatalogCommand('reset', '重置推送额度窗口（不解除会话绑定，不调用模型）', [
++    '/reset  重新激活被风控的主动推送窗口；不解除会话绑定，不调用模型',
 +  ]),
    defineCatalogCommand('compact', '压缩当前会话的较早上下文', [
      '/compact  压缩当前会话的较早上下文',
@@ -1055,21 +1055,21 @@ index fa335e8..bc7cc29 100644
      '/send  提交当前批次',
    ], { privateOnly: true }),
 diff --git a/src/channels/shared/i18n-en/shared-c.mjs b/src/channels/shared/i18n-en/shared-c.mjs
-index f07a9dd..eb15760 100644
+index f07a9dd..9934800 100644
 --- a/src/channels/shared/i18n-en/shared-c.mjs
 +++ b/src/channels/shared/i18n-en/shared-c.mjs
 @@ -195,6 +195,15 @@ export default {
    '已取消批量输入。': 'Batch input cancelled.',
    '已取消批量输入，共丢弃 {count} 条消息。':
      'Batch input cancelled; {count} messages were discarded.',
-+  '/reset  重置会话与上下文；IM 端发送它也会重新激活被风控的推送窗口':
-+    '/reset  Reset the session and context; sending it from IM also re-activates a throttled push window',
-+  '重置当前会话（本地命令，不调用模型）':
-+    'Reset the current session (local command, no model call)',
-+  '已重置当前会话与上下文（本地命令，未调用模型）。如果微信主动推送被限制，这条入站消息已重新激活会话。':
-+    'Session and context reset (local command, no model call). If proactive pushes were throttled, this inbound message has re-activated the conversation.',
-+  '已重置当前会话与上下文（本地命令，未调用模型）。':
-+    'Session and context reset (local command, no model call).',
++  '/reset  重新激活被风控的主动推送窗口；不解除会话绑定，不调用模型':
++    '/reset  Re-activate a throttled proactive push window; keeps the Session binding, no model call',
++  '重置推送额度窗口（不解除会话绑定，不调用模型）':
++    'Reset the push allowance window (keeps the Session binding, no model call)',
++  '已重置推送额度窗口（会话绑定保持不变，未调用模型）。如果微信此前限制了主动推送，这条入站消息已将其重新激活。':
++    'Push allowance window reset (Session binding unchanged, no model call). If WeChat was throttling proactive sends, this inbound message re-activated them.',
++  '已重置推送额度窗口（会话绑定保持不变，未调用模型）。':
++    'Push allowance window reset (Session binding unchanged, no model call).',
 +
    '当前批次还没有内容，请先发送文字，或使用 /cancel 取消。':
      'The current batch is empty. Send some text first or use /cancel.',
@@ -1114,7 +1114,7 @@ index f07a9dd..eb15760 100644
      'You can send regular messages, but you do not have permission to run commands.',
  };
 diff --git a/src/channels/shared/text-harness-bridge.mjs b/src/channels/shared/text-harness-bridge.mjs
-index ffb2f5f..449e41f 100644
+index ffb2f5f..5032b6a 100644
 --- a/src/channels/shared/text-harness-bridge.mjs
 +++ b/src/channels/shared/text-harness-bridge.mjs
 @@ -388,7 +388,7 @@ export class TextHarnessBridge {
@@ -1192,23 +1192,37 @@ index ffb2f5f..449e41f 100644
    async #deliverArtifacts(target, replyTo, artifacts = [], baseReceipt) {
      const delivery = await deliverOutboundArtifacts({
        artifacts,
-@@ -1124,7 +1152,7 @@ export class TextHarnessBridge {
+@@ -1124,17 +1152,24 @@ export class TextHarnessBridge {
          }
          return;
        }
 -      if (!hasImages && !hasFiles && command === '/new') {
+-        await this.#state.clearSession(conversationKey);
+-        if (this.#contextHooks?.onSessionCleared) {
+-          try {
+-            await this.#contextHooks.onSessionCleared(conversationKey);
+-          } catch (error) {
+-            // The cleared session is already done; a failed context reset must not block the command.
+-            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
 +      if (!hasImages && !hasFiles && (command === '/new' || command === '/reset')) {
-         await this.#state.clearSession(conversationKey);
-         if (this.#contextHooks?.onSessionCleared) {
-           try {
-@@ -1134,7 +1162,9 @@ export class TextHarnessBridge {
-             this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
++        if (command === '/new') {
++          // /new is the only command that unbinds the chat from its Session.
++          await this.#state.clearSession(conversationKey);
++          if (this.#contextHooks?.onSessionCleared) {
++            try {
++              await this.#contextHooks.onSessionCleared(conversationKey);
++            } catch (error) {
++              // The cleared session is already done; a failed context reset must not block the command.
++              this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
++            }
            }
++          await this.#bot.sendText(target, t('已开启新会话。请发送你的问题。'));
++        } else {
++          // /reset keeps the Session binding and only re-activates the channel's
++          // proactive window; the inbound message itself does that on WeChat.
++          await this.#bot.sendText(target, t('已重置推送额度窗口（会话绑定保持不变，未调用模型）。'));
          }
 -        await this.#bot.sendText(target, t('已开启新会话。请发送你的问题。'));
-+        await this.#bot.sendText(target, command === '/reset'
-+          ? t('已重置当前会话与上下文（本地命令，未调用模型）。')
-+          : t('已开启新会话。请发送你的问题。'));
          return;
        }
        const compactCommand = !hasImages && !hasFiles
@@ -1472,7 +1486,7 @@ index de41787..e20837f 100644
      // Each start() gets a fresh controller; stop() aborts the latest one.
      if (this.#controller.signal.aborted) this.#controller = new AbortController();
 diff --git a/src/channels/weixin/weixin-bridge.mjs b/src/channels/weixin/weixin-bridge.mjs
-index 40f781a..dd0eb4b 100644
+index 40f781a..2559f4b 100644
 --- a/src/channels/weixin/weixin-bridge.mjs
 +++ b/src/channels/weixin/weixin-bridge.mjs
 @@ -235,6 +235,37 @@ export function weixinInboundMessage(message, api, state, { loadReplyContent } =
@@ -1569,22 +1583,28 @@ index 40f781a..dd0eb4b 100644
        this.#inboundMessage(message),
        { signal: this.#signal },
      );
-@@ -818,9 +871,16 @@ export class WeixinHarnessBridge {
+@@ -818,9 +871,21 @@ export class WeixinHarnessBridge {
          await this.#state.markSeen(messageId);
          return;
        }
 -      if (!hasImages && !hasFiles && command === '/new') {
-+      if (!hasImages && !hasFiles && (command === '/new' || command === '/reset')) {
-         await this.#state.clearSession(key);
+-        await this.#state.clearSession(key);
 -        await this.#send(sender, t('已开启新会话。请发送你的问题。'), contextToken, runId);
-+        await this.#send(
-+          sender,
-+          command === '/reset'
-+            ? t('已重置当前会话与上下文（本地命令，未调用模型）。如果微信主动推送被限制，这条入站消息已重新激活会话。')
-+            : t('已开启新会话。请发送你的问题。'),
-+          contextToken,
-+          runId,
-+        );
++      if (!hasImages && !hasFiles && (command === '/new' || command === '/reset')) {
++        if (command === '/new') {
++          // /new is the only command that unbinds the chat from its Session.
++          await this.#state.clearSession(key);
++          await this.#send(sender, t('已开启新会话。请发送你的问题。'), contextToken, runId);
++        } else {
++          // /reset keeps the Session binding: it only re-activates the channel's
++          // proactive window (the inbound message itself does that on WeChat).
++          await this.#send(
++            sender,
++            t('已重置推送额度窗口（会话绑定保持不变，未调用模型）。如果微信此前限制了主动推送，这条入站消息已将其重新激活。'),
++            contextToken,
++            runId,
++          );
++        }
          await this.#state.markSeen(messageId);
          return;
        }
