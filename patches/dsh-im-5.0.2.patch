@@ -1,0 +1,1647 @@
+diff --git a/plugin-src/host/delivery-adapter.mjs b/plugin-src/host/delivery-adapter.mjs
+index efc4b19..527e26d 100644
+--- a/plugin-src/host/delivery-adapter.mjs
++++ b/plugin-src/host/delivery-adapter.mjs
+@@ -316,6 +316,15 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
+       const result = await coreController.sendProactiveText(botId, normalized, text, options);
+       return options.receipt === true ? result : { sent: true };
+     },
++    async sendFile(botId, target, file, options = {}) {
++      const normalized = normalizeDeliveryTarget(channel, targetWithoutSessionSync(target));
++      if (typeof coreController.sendProactiveFile !== 'function') {
++        const error = new Error('This channel cannot send files proactively');
++        error.code = 'capability-unavailable';
++        throw error;
++      }
++      return coreController.sendProactiveFile(botId, normalized, file, options);
++    },
+     async setSessionSync(botId, targetId, enabled) {
+       if (typeof workspaces.setDeliveryTargetSessionSync !== 'function') {
+         throw sessionSyncUnavailable();
+diff --git a/plugin-src/host/delivery-http.mjs b/plugin-src/host/delivery-http.mjs
+index 7056daa..c5a7935 100644
+--- a/plugin-src/host/delivery-http.mjs
++++ b/plugin-src/host/delivery-http.mjs
+@@ -1,6 +1,7 @@
+ import { createDeliveryRpcHandler, DELIVERY_ENDPOINTS } from './delivery-rpc.mjs';
+ 
+ export const DELIVERY_HTTP_PATH = '/api/dsh-im/delivery/messages';
++export const DELIVERY_FILE_HTTP_PATH = '/api/dsh-im/delivery/files';
+ 
+ const MAX_BODY_BYTES = 1024 * 1024;
+ 
+@@ -65,7 +66,7 @@ async function readJsonBody(request) {
+   }
+ }
+ 
+-export function createDeliveryHttpHandler(service) {
++export function createDeliveryHttpHandler(service, endpoint = DELIVERY_ENDPOINTS.send) {
+   const dispatch = createDeliveryRpcHandler(service);
+   return async (request, response) => {
+     if (request.method !== 'POST') {
+@@ -90,7 +91,7 @@ export function createDeliveryHttpHandler(service) {
+     response.once('close', cancelClosedResponse);
+     try {
+       const payload = await readJsonBody(request);
+-      const result = await dispatch(DELIVERY_ENDPOINTS.send, payload, abort.signal);
++      const result = await dispatch(endpoint, payload, abort.signal);
+       if (result.ok) {
+         json(response, 200, result.value);
+         return;
+@@ -120,13 +121,27 @@ export function installDeliveryHttp(ctx, service) {
+     || typeof ctx.effect !== 'function') {
+     throw new TypeError('DSH Host WebServer is required');
+   }
+-  const route = {
+-    kind: 'exact',
+-    path: DELIVERY_HTTP_PATH,
+-    handler: createDeliveryHttpHandler(service),
+-  };
++  const routes = [
++    {
++      kind: 'exact',
++      path: DELIVERY_HTTP_PATH,
++      handler: createDeliveryHttpHandler(service, DELIVERY_ENDPOINTS.send),
++    },
++    {
++      kind: 'exact',
++      path: DELIVERY_FILE_HTTP_PATH,
++      handler: createDeliveryHttpHandler(service, DELIVERY_ENDPOINTS.sendFile),
++    },
++  ];
+   return ctx.effect(
+-    () => ctx.webServer.register(route),
+-    `dsh-im: ${DELIVERY_HTTP_PATH}`,
++    () => {
++      const disposers = routes.map((route) => ctx.webServer.register(route));
++      return () => {
++        for (const dispose of disposers) {
++          try { dispose?.(); } catch { /* registration disposal is best-effort */ }
++        }
++      };
++    },
++    `dsh-im: ${DELIVERY_HTTP_PATH}, ${DELIVERY_FILE_HTTP_PATH}`,
+   );
+ }
+diff --git a/plugin-src/host/delivery-rpc.mjs b/plugin-src/host/delivery-rpc.mjs
+index 7ad719f..531a3e2 100644
+--- a/plugin-src/host/delivery-rpc.mjs
++++ b/plugin-src/host/delivery-rpc.mjs
+@@ -5,6 +5,7 @@ export const DELIVERY_RPC_CHANNEL = '/dsh-im-delivery';
+ export const DELIVERY_TEST_MESSAGE = 'DSH-IM 主动投递测试成功。';
+ export const DELIVERY_ENDPOINTS = Object.freeze({
+   send: 'message.send',
++  sendFile: 'file.send',
+   listTargets: 'target.list',
+   listSuggestions: 'target.suggestion.list',
+   createTarget: 'target.create',
+@@ -17,6 +18,7 @@ export const DELIVERY_ENDPOINTS = Object.freeze({
+ const ENDPOINTS = new Set(Object.values(DELIVERY_ENDPOINTS));
+ const PUBLIC_ERRORS = new Set([
+   'bad-request',
++  'capability-unavailable',
+   'unknown-bot',
+   'unknown-target',
+   'target-conflict',
+@@ -64,6 +66,11 @@ function validDraftTarget(value) {
+ 
+ function validPayload(endpoint, payload) {
+   if (!ENDPOINTS.has(endpoint) || !isRecord(payload)) return false;
++  if (endpoint === DELIVERY_ENDPOINTS.sendFile) {
++    return exactKeys(payload, ['botId', 'targetId', 'path'])
++      && validBotId(payload.botId) && validTargetId(payload.targetId)
++      && typeof payload.path === 'string' && Boolean(payload.path.trim());
++  }
+   if (endpoint === DELIVERY_ENDPOINTS.send) {
+     return (exactKeys(payload, ['botId', 'targetId', 'text'])
+         || (exactKeys(payload, ['botId', 'targetId', 'text', 'format'])
+@@ -134,6 +141,10 @@ export function createDeliveryRpcHandler(service) {
+           signal,
+           ...(payload.format === undefined ? {} : { format: payload.format }),
+         });
++      } else if (endpoint === DELIVERY_ENDPOINTS.sendFile) {
++        value = await service.sendFile(payload.botId, payload.targetId, {
++          path: payload.path,
++        }, { signal });
+       } else if (endpoint === DELIVERY_ENDPOINTS.listTargets) {
+         value = await service.listTargets(payload.botId);
+       } else if (endpoint === DELIVERY_ENDPOINTS.listSuggestions) {
+diff --git a/plugin-src/host/delivery-service.mjs b/plugin-src/host/delivery-service.mjs
+index 76c6ce7..ee39acc 100644
+--- a/plugin-src/host/delivery-service.mjs
++++ b/plugin-src/host/delivery-service.mjs
+@@ -1,4 +1,6 @@
+ import { createHash } from 'node:crypto';
++import { readFile, stat } from 'node:fs/promises';
++import { basename, extname, isAbsolute } from 'node:path';
+ import { normalizeDeliveryTarget } from './delivery-adapter.mjs';
+ import { COMPETITIVE_APPROVAL_CHANNELS } from '../../src/channels/shared/harness-approval.mjs';
+ import { t } from '../../src/channels/shared/i18n.mjs';
+@@ -7,6 +9,30 @@ const BOT_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+ const TARGET_ID_PATTERN = /^[A-Za-z0-9._:@-]{1,128}$/;
+ const CHANNEL_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+ const DRAFT_TARGET_ID = '__test__';
++const MAX_DELIVERY_FILE_BYTES = 30 * 1024 * 1024;
++const DELIVERY_MEDIA_TYPES = Object.freeze({
++  '.pdf': 'application/pdf',
++  '.png': 'image/png',
++  '.jpg': 'image/jpeg',
++  '.jpeg': 'image/jpeg',
++  '.gif': 'image/gif',
++  '.webp': 'image/webp',
++  '.txt': 'text/plain',
++  '.md': 'text/markdown',
++  '.csv': 'text/csv',
++  '.json': 'application/json',
++  '.zip': 'application/zip',
++  '.doc': 'application/msword',
++  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
++  '.xls': 'application/vnd.ms-excel',
++  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
++  '.ppt': 'application/vnd.ms-powerpoint',
++  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
++  '.mp3': 'audio/mpeg',
++  '.m4a': 'audio/mp4',
++  '.wav': 'audio/wav',
++  '.mp4': 'video/mp4',
++});
+ 
+ const ADAPTER_METHODS = Object.freeze([
+   'ownsBot',
+@@ -526,6 +552,53 @@ export class DeliveryService {
+     }
+   }
+ 
++  async sendFile(botId, targetId, file, { signal } = {}) {
++    const id = botIdOf(botId);
++    const key = targetIdOf(targetId);
++    const requested = typeof file?.path === 'string' ? file.path.trim() : '';
++    if (!requested || !isAbsolute(requested)) {
++      throw deliveryError('bad-request', 'An absolute file path is required');
++    }
++    let details;
++    try {
++      details = await stat(requested);
++    } catch {
++      throw deliveryError('bad-request', 'The file does not exist');
++    }
++    if (!details.isFile()) throw deliveryError('bad-request', 'The path is not a regular file');
++    if (details.size > MAX_DELIVERY_FILE_BYTES) {
++      throw deliveryError('bad-request', 'The file exceeds the 30 MB delivery limit');
++    }
++    let bytes;
++    try {
++      bytes = await readFile(requested);
++    } catch {
++      throw deliveryError('bad-request', 'The file cannot be read');
++    }
++    const fileName = basename(requested);
++    const mediaType = DELIVERY_MEDIA_TYPES[extname(fileName).toLowerCase()];
++    cancellation(signal);
++    const adapter = await this.#adapterFor(id);
++    try {
++      const targets = await adapter.listTargets(id);
++      if (!Array.isArray(targets)) throw new TypeError('Adapter returned invalid targets');
++      const target = targets.find((candidate) => candidate?.targetId === key);
++      if (!target) throw deliveryError('unknown-target', 'Unknown target');
++      cancellation(signal);
++      const result = await adapter.sendFile(id, target, {
++        fileName,
++        ...(mediaType === undefined ? {} : { mediaType }),
++        bytes,
++      }, { signal });
++      return { sent: true, fileName, ...(result?.receipt === undefined ? {} : { receipt: result.receipt }) };
++    } catch (error) {
++      if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
++        throw deliveryError('cancelled', 'Request cancelled', { cause: error });
++      }
++      throw publicOperationError(error);
++    }
++  }
++
+   async #checkedRegistrationFor(botId) {
+     for (const registration of this.#adapters.values()) {
+       let ownsBot;
+diff --git a/src/channels/dingtalk/dingtalk-controller.mjs b/src/channels/dingtalk/dingtalk-controller.mjs
+index 04db6a1..4bf30b2 100644
+--- a/src/channels/dingtalk/dingtalk-controller.mjs
++++ b/src/channels/dingtalk/dingtalk-controller.mjs
+@@ -442,6 +442,21 @@ export class DingtalkController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown DingTalk bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('钉钉消息连接当前离线'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown DingTalk bot');
+diff --git a/src/channels/dingtalk/dingtalk-runtime.mjs b/src/channels/dingtalk/dingtalk-runtime.mjs
+index 084330b..37fcc4d 100644
+--- a/src/channels/dingtalk/dingtalk-runtime.mjs
++++ b/src/channels/dingtalk/dingtalk-runtime.mjs
+@@ -483,6 +483,40 @@ export class DingtalkRuntime {
+     return { sent: true };
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const userId = typeof target?.route?.userId === 'string'
++      ? target.route.userId.trim() : '';
++    const openConversationId = typeof target?.route?.openConversationId === 'string'
++      ? target.route.openConversationId.trim() : '';
++    if ((target?.kind === 'user' && (!userId || openConversationId))
++      || (target?.kind === 'group' && (!openConversationId || userId))
++      || (target?.kind !== 'user' && target?.kind !== 'group')) {
++      const error = new TypeError('Invalid DingTalk proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#status.ready || !this.#abortController || !this.#api) {
++      const error = new Error('DingTalk runtime is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    signal?.throwIfAborted();
++    const method = typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/')
++      && typeof this.#api.sendImage === 'function' ? 'sendImage' : 'sendFile';
++    if (typeof this.#api[method] !== 'function') {
++      const error = new Error('DingTalk cannot send this file type');
++      error.code = 'capability-unavailable';
++      throw error;
++    }
++    return await this.#api[method]({
++      clientId: this.#config.clientId,
++      clientSecret: this.#clientSecret,
++      target: { kind: target.kind, id: target.kind === 'user' ? userId : openConversationId },
++      file,
++      signal,
++    });
++  }
++
+   #pendingSenders() {
+     return typeof this.#state.pendingSenders === 'function'
+       ? this.#state.pendingSenders()
+diff --git a/src/channels/discord/discord-runtime.mjs b/src/channels/discord/discord-runtime.mjs
+index bc65747..8a53538 100644
+--- a/src/channels/discord/discord-runtime.mjs
++++ b/src/channels/discord/discord-runtime.mjs
+@@ -645,6 +645,22 @@ export class DiscordRuntime {
+     return this.#bridge.sendProactiveText({ channelId }, text, options);
+   }
+ 
++  async sendProactiveFile(target, file, options = {}) {
++    if (!this.#status.ready || !this.#bridge) {
++      const error = new Error('Discord bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const channelId = typeof target?.route?.channelId === 'string'
++      ? target.route.channelId.trim() : '';
++    if (target?.kind !== 'channel' || !channelId) {
++      const error = new TypeError('Invalid Discord proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    return this.#bridge.sendProactiveFile({ channelId }, file, options);
++  }
++
+   async start() {
+     if (this.#status.ready && this.#socket) return this.status;
+     if (this.#starting) return this.#starting;
+diff --git a/src/channels/email/email-controller.mjs b/src/channels/email/email-controller.mjs
+index 07f7d11..3bdcbe1 100644
+--- a/src/channels/email/email-controller.mjs
++++ b/src/channels/email/email-controller.mjs
+@@ -342,6 +342,17 @@ export class EmailController {
+     return runtime.sendProactiveText(target, text, options);
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const runtime = this.#runtimes.get(botId);
++    if (!runtime) {
++      const error = new Error(t('邮箱尚未连接'));
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    return runtime.sendProactiveFile(target, file, options);
++  }
++
++
+   async deleteBot(botId) {
+     const warnings = [];
+     return this.#withBotTransition(botId, async () => {
+diff --git a/src/channels/email/email-runtime.mjs b/src/channels/email/email-runtime.mjs
+index 84cd0a5..4a642a4 100644
+--- a/src/channels/email/email-runtime.mjs
++++ b/src/channels/email/email-runtime.mjs
+@@ -407,6 +407,21 @@ export class EmailRuntime {
+     return { sent: true };
+   }
+ 
++  async sendProactiveFile(target, file, options = {}) {
++    if (!this.#status.ready || !this.#api) {
++      const error = new Error('Email mailbox is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const to = normalizeAddress(target?.route?.address);
++    if (!to) {
++      const error = new TypeError('Invalid Email proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    return this.#api.sendFile({ to, subject: target?.route?.subject ?? 'DSH 文件' }, file);
++  }
++
+   async start() {
+     if (this.#status.ready) return this.status;
+     await this.stop();
+diff --git a/src/channels/feishu/bridge.mjs b/src/channels/feishu/bridge.mjs
+index 44e5bcd..a0353d9 100644
+--- a/src/channels/feishu/bridge.mjs
++++ b/src/channels/feishu/bridge.mjs
+@@ -4610,6 +4610,23 @@ export class FeishuHarnessBridge {
+     return nonEmptyString(response?.data?.message_id);
+   }
+ 
++  async sendProactiveFile(chatId, file, { signal } = {}) {
++    const receiveId = typeof chatId === 'string' ? chatId.trim() : '';
++    if (!receiveId) {
++      const error = new TypeError('Invalid Feishu proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    const image = typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/');
++    const method = image && typeof this.#channel?.sendImage === 'function' ? 'sendImage' : 'sendFile';
++    if (typeof this.#channel?.[method] !== 'function') {
++      const error = new Error('Feishu cannot send this file type');
++      error.code = 'capability-unavailable';
++      throw error;
++    }
++    return await this.#channel[method](receiveId, file, { signal });
++  }
++
+   async #deliverArtifacts(chatId, replyTo, artifacts = [], baseReceipt) {
+     const delivery = await deliverOutboundArtifacts({
+       artifacts,
+diff --git a/src/channels/feishu/feishu-runtime.mjs b/src/channels/feishu/feishu-runtime.mjs
+index 267b19e..ababeb4 100644
+--- a/src/channels/feishu/feishu-runtime.mjs
++++ b/src/channels/feishu/feishu-runtime.mjs
+@@ -708,6 +708,21 @@ export class FeishuRuntime {
+     }, options);
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    if (!this.#status.ready || !this.#bridge) {
++      const error = new Error('飞书机器人尚未连接');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const chatId = target?.kind === 'group' ? nonEmptyString(target?.route?.chatId) : null;
++    if (!chatId) {
++      const error = new TypeError('Feishu file delivery currently requires a group target');
++      error.code = 'capability-unavailable';
++      throw error;
++    }
++    return await this.#bridge.sendProactiveFile(chatId, file, { signal });
++  }
++
+   async sendProactiveText(target, text, { signal, format = 'plain', receipt = false } = {}) {
+     if (!this.#status.ready || !this.#client) {
+       const error = new Error('飞书机器人尚未连接');
+diff --git a/src/channels/feishu/multi-bot-controller.mjs b/src/channels/feishu/multi-bot-controller.mjs
+index f49abb2..6e79f8f 100644
+--- a/src/channels/feishu/multi-bot-controller.mjs
++++ b/src/channels/feishu/multi-bot-controller.mjs
+@@ -717,6 +717,37 @@ export class MultiBotDshFeishuController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const checked = options.expectedFingerprint !== undefined;
++    this.#assertOpen(checked ? 'capability-unavailable' : undefined);
++    return this.#withBotTransition(botId, async () => {
++      this.#assertOpen(checked ? 'capability-unavailable' : undefined);
++      const config = this.#requireBot(botId);
++      if (checked) {
++        const account = await this.#deliveryAccount(config);
++        if (account.fingerprint !== options.expectedFingerprint) {
++          const error = new Error('Authenticated account identity changed');
++          error.code = 'account-changed';
++          throw error;
++        }
++        // Account verification yields; a Registration can be replaced or disposed
++        // before the SDK request starts. Recheck its owner at the effect boundary.
++        options.beforeSend?.();
++        this.#assertOpen('capability-unavailable');
++        options.signal?.throwIfAborted();
++      }
++      const runtime = this.#runtimes.get(botId);
++      if (!isConnected(connectionStatus(runtime))
++        || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error('飞书机器人尚未连接');
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     this.#assertOpen();
+     return this.#withBotTransition(botId, async () => {
+diff --git a/src/channels/imessage/runtime.mjs b/src/channels/imessage/runtime.mjs
+index 44a94af..0b369a5 100644
+--- a/src/channels/imessage/runtime.mjs
++++ b/src/channels/imessage/runtime.mjs
+@@ -50,6 +50,12 @@ export class IMessageRuntime {
+       }),
+     });
+   }
++  async sendProactiveFile(_target, _file, _options = {}) {
++    const error = new Error('iMessage cannot send files');
++    error.code = 'capability-unavailable';
++    throw error;
++  }
++
+   async sendProactiveText(target, text, options = {}) {
+     if (!this.#status.ready || !this.#api) { const error = new Error('iMessage gateway is not connected'); error.code = 'bot-not-connected'; throw error; }
+     const chatGuid = target?.route?.chatGuid;
+diff --git a/src/channels/matrix/matrix-controller.mjs b/src/channels/matrix/matrix-controller.mjs
+index f612503..95ec9b3 100644
+--- a/src/channels/matrix/matrix-controller.mjs
++++ b/src/channels/matrix/matrix-controller.mjs
+@@ -224,6 +224,16 @@ export class MatrixController {
+     return { sent: true };
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    this.#requireId(botId);
++    const runtime = this.#runtimes.get(botId);
++    if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++      throw new Error('Matrix bot is not connected for proactive delivery');
++    }
++    await runtime.sendProactiveFile(target, file, options);
++    return { sent: true };
++  }
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     this.#requireId(botId);
+     const runtime = this.#runtimes.get(botId);
+diff --git a/src/channels/matrix/matrix-runtime.mjs b/src/channels/matrix/matrix-runtime.mjs
+index 032b39e..6976e84 100644
+--- a/src/channels/matrix/matrix-runtime.mjs
++++ b/src/channels/matrix/matrix-runtime.mjs
+@@ -520,6 +520,28 @@ export class MatrixRuntime {
+ 
+   // ---- 端到端加密 ----
+ 
++  async sendProactiveFile(target, file, options = {}) {
++    const api = this.#api;
++    if (!api) {
++      const error = new Error('Matrix bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const normalized = normalizeMatrixDeliveryTarget(target ?? {});
++    if (normalized.error) {
++      const error = new Error(`Matrix delivery target is invalid: ${normalized.error}`);
++      error.code = 'invalid-target';
++      throw error;
++    }
++    const route = normalized.value;
++    const isImage = typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/');
++    if (route.kind === 'dm') {
++      const roomId = await this.#resolveDmRoom(route.userId, options);
++      return await this.#sendArtifact({ roomId, threadId: null }, file, isImage);
++    }
++    return await this.#sendArtifact({ roomId: route.roomId, threadId: route.threadId ?? null }, file, isImage);
++  }
++
+   async #startCrypto(api, userId, deviceId) {
+     this.#crypto = null;
+     this.#e2eeActive = false;
+diff --git a/src/channels/qq/qq-bridge.mjs b/src/channels/qq/qq-bridge.mjs
+index dda6af8..d1f3745 100644
+--- a/src/channels/qq/qq-bridge.mjs
++++ b/src/channels/qq/qq-bridge.mjs
+@@ -384,7 +384,7 @@ export async function sendQqImage(
+   }
+ }
+ 
+-async function sendQqFile(
++export async function sendQqFile(
+   bot,
+   target,
+   file,
+diff --git a/src/channels/qq/qq-controller.mjs b/src/channels/qq/qq-controller.mjs
+index d66da36..cb2c2fa 100644
+--- a/src/channels/qq/qq-controller.mjs
++++ b/src/channels/qq/qq-controller.mjs
+@@ -297,6 +297,21 @@ export class QqController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown QQ bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('QQ机器人尚未连接'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown QQ bot');
+diff --git a/src/channels/qq/qq-runtime.mjs b/src/channels/qq/qq-runtime.mjs
+index 739880e..3f3cdd4 100644
+--- a/src/channels/qq/qq-runtime.mjs
++++ b/src/channels/qq/qq-runtime.mjs
+@@ -7,7 +7,7 @@ import {
+ } from '../shared/connection-test.mjs';
+ import { t } from '../shared/i18n.mjs';
+ import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
+-import { createQqBridgeStatus, QqHarnessBridge } from './qq-bridge.mjs';
++import { createQqBridgeStatus, sendQqFile, sendQqImage, QqHarnessBridge } from './qq-bridge.mjs';
+ import { isQqMessageAddressed, normalizeQqMentions } from './qq-mention.mjs';
+ import { sendMarkdownReply } from './markdown-reply.mjs';
+ 
+@@ -115,6 +115,34 @@ export class QqRuntime {
+     }, options);
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const nativeId = target?.kind === 'user'
++      ? (typeof target?.route?.userOpenId === 'string' ? target.route.userOpenId.trim() : '')
++      : target?.kind === 'group'
++        ? (typeof target?.route?.groupOpenId === 'string' ? target.route.groupOpenId.trim() : '')
++        : '';
++    if (!nativeId) {
++      const error = new TypeError('Invalid QQ proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#status.ready || !this.#bot) {
++      const error = new Error('QQ bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    signal?.throwIfAborted();
++    const replyTarget = {
++      scope: target.kind === 'user' ? 'c2c' : 'group',
++      targetId: nativeId,
++    };
++    const image = typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/');
++    if (image && typeof sendQqImage === 'function') {
++      return sendQqImage(this.#bot, replyTarget, file, { signal });
++    }
++    return sendQqFile(this.#bot, replyTarget, file, { signal });
++  }
++
+   async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
+     const nativeId = target?.kind === 'user'
+       ? (typeof target?.route?.userOpenId === 'string' ? target.route.userOpenId.trim() : '')
+diff --git a/src/channels/shared/batch-input.mjs b/src/channels/shared/batch-input.mjs
+index 92234f8..7f7a2f6 100644
+--- a/src/channels/shared/batch-input.mjs
++++ b/src/channels/shared/batch-input.mjs
+@@ -1,9 +1,12 @@
+ import { t } from './i18n.mjs';
+ 
+ export const BATCH_INPUT_LIMIT = 10;
++/** Keep one staged submission inside the host's per-turn attachment limits. */
++const MAX_TOTAL_IMAGES = 20;
++const MAX_TOTAL_FILES = 10;
+ 
+-const BATCH_COMMAND = /^\/(batch|send|cancel)(?=$|\s)/iu;
+-const EXACT_BATCH_COMMAND = /^\/(batch|send|cancel)$/iu;
++const BATCH_COMMAND = /^\/(batch|hold|send|cancel)(?=$|\s)/iu;
++const EXACT_BATCH_COMMAND = /^\/(batch|hold|send|cancel)$/iu;
+ 
+ function commandName(text) {
+   if (typeof text !== 'string') return null;
+@@ -14,23 +17,79 @@ function result(kind, message, extra = {}) {
+   return { handled: true, kind, ...(message ? { message } : {}), ...extra };
+ }
+ 
+-function progressMessage(count) {
+-  if (count === BATCH_INPUT_LIMIT) {
++function modeLabel(mode) {
++  return mode === 'hold' ? t('暂存') : t('批量输入');
++}
++
++function countEntries(entries) {
++  let texts = 0;
++  let images = 0;
++  let files = 0;
++  for (const entry of entries) {
++    if (typeof entry.text === 'string' && entry.text.trim()) texts += 1;
++    if (Array.isArray(entry.images)) images += entry.images.length;
++    if (Array.isArray(entry.files)) files += entry.files.length;
++  }
++  return { count: entries.length, texts, images, files };
++}
++
++function detailText(detail) {
++  return t('文字 {texts} 条、图片 {images} 张、文件 {files} 个', detail);
++}
++
++function progressMessage(entries, mode) {
++  const detail = countEntries(entries);
++  if (mode === 'hold') {
++    if (detail.count >= BATCH_INPUT_LIMIT) {
++      return t('暂存已满（{count}/{limit} 项：{detail}）。请发送 /send 提交或 /cancel 取消。', {
++        count: detail.count,
++        limit: BATCH_INPUT_LIMIT,
++        detail: detailText(detail),
++      });
++    }
++    return t('已暂存 {count}/{limit} 项（{detail}）。发送 /send 一次性提交，/cancel 取消。', {
++      count: detail.count,
++      limit: BATCH_INPUT_LIMIT,
++      detail: detailText(detail),
++    });
++  }
++  if (detail.count === BATCH_INPUT_LIMIT) {
+     return t(`当前已处于批量输入模式，已收集 {count}/{limit} 条。
+-请发送 /send 提交或 /cancel 取消。`, { count, limit: BATCH_INPUT_LIMIT });
++请发送 /send 提交或 /cancel 取消。`, { count: detail.count, limit: BATCH_INPUT_LIMIT });
+   }
+   return t(`当前已处于批量输入模式，已收集 {count}/{limit} 条。
+-完成后发送 /send，取消请发送 /cancel。`, { count, limit: BATCH_INPUT_LIMIT });
++完成后发送 /send，取消请发送 /cancel。`, { count: detail.count, limit: BATCH_INPUT_LIMIT });
+ }
+ 
+-function submissionPrompt(messages) {
+-  const sections = messages.map((message, index) => (
+-    `${t('[消息 {index}]', { index: index + 1 })}\n${message}`
+-  ));
+-  return [
+-    t('以下是用户通过批量输入模式发送的多条内容，请按顺序作为同一次输入统一处理。'),
+-    ...sections,
+-  ].join('\n\n');
++function submissionPrompt(entries, mode) {
++  if (mode !== 'hold') {
++    const messages = entries
++      .map((entry) => entry.text)
++      .filter((message) => typeof message === 'string' && message.trim());
++    return [
++      t('以下是用户通过批量输入模式发送的多条内容，请按顺序作为同一次输入统一处理。'),
++      ...messages.map((message, index) => (
++        `${t('[消息 {index}]', { index: index + 1 })}\n${message}`
++      )),
++    ].join('\n\n');
++  }
++  const detail = countEntries(entries);
++  const lines = [
++    t('以下是用户暂存后一次性提交的 {count} 项内容（{detail}），请按顺序作为同一次输入统一处理。', {
++      count: detail.count,
++      detail: detailText(detail),
++    }),
++  ];
++  let index = 0;
++  for (const entry of entries) {
++    if (typeof entry.text !== 'string' || !entry.text.trim()) continue;
++    index += 1;
++    lines.push('', `${t('[消息 {index}]', { index })}`, entry.text);
++  }
++  if (detail.images > 0 || detail.files > 0) {
++    lines.push('', t('随本条消息附带的图片和文件见附件清单。'));
++  }
++  return lines.join('\n');
+ }
+ 
+ /**
+@@ -41,8 +100,39 @@ function submissionPrompt(messages) {
+  * text where the user's own words belong. The first collected message is what
+  * the user actually said first.
+  */
+-function submissionTitle(messages) {
+-  return messages.find((message) => message.trim()) ?? '';
++function submissionTitle(entries) {
++  return entries.find((entry) => typeof entry.text === 'string' && entry.text.trim())?.text ?? '';
++}
++
++/**
++ * Start downloading images the moment they are staged.
++ *
++ * Staged media may wait minutes before /send, and several channels hand out
++ * short-lived download links. Wrapping the source here kicks the download off
++ * and keeps the promise, so the later load reuses those bytes instead of
++ * starting over against an expired URL.
++ */
++export function prefetchStagedImages(sources, signal) {
++  if (!Array.isArray(sources)) return [];
++  return sources.map((source) => {
++    if (!source || source.data !== undefined || typeof source.load !== 'function') return source;
++    let download;
++    try {
++      download = Promise.resolve(source.load({ signal }));
++    } catch (error) {
++      download = Promise.reject(error);
++    }
++    download.catch(() => undefined);
++    return {
++      ...source,
++      async load({ signal: loadSignal } = {}) {
++        loadSignal?.throwIfAborted();
++        const result = await download;
++        loadSignal?.throwIfAborted();
++        return result;
++      },
++    };
++  });
+ }
+ 
+ export function isBatchInputCommand(text) {
+@@ -64,17 +154,23 @@ export class BatchInputManager {
+   status(key) {
+     const batch = this.#batches.get(key);
+     if (!batch) {
+-      return Object.freeze({ phase: 'idle', count: 0, limit: BATCH_INPUT_LIMIT, full: false });
++      return Object.freeze({
++        phase: 'idle', mode: null, count: 0, limit: BATCH_INPUT_LIMIT, full: false,
++      });
+     }
++    const detail = countEntries(batch.entries);
+     return Object.freeze({
+       phase: batch.phase,
+-      count: batch.messages.length,
++      mode: batch.mode,
++      count: detail.count,
++      images: detail.images,
++      files: detail.files,
+       limit: BATCH_INPUT_LIMIT,
+-      full: batch.messages.length === BATCH_INPUT_LIMIT,
++      full: detail.count === BATCH_INPUT_LIMIT,
+     });
+   }
+ 
+-  handle(key, text, { plainText = true } = {}) {
++  handle(key, text, { plainText = true, images = [], files = [] } = {}) {
+     const batch = this.#batches.get(key);
+     const name = commandName(text);
+     const exact = typeof text === 'string' ? EXACT_BATCH_COMMAND.exec(text.trim()) : null;
+@@ -83,12 +179,16 @@ export class BatchInputManager {
+       return result('invalid-command', t('用法：/{command}（不带参数）', { command: name }));
+     }
+ 
++    const messageImages = Array.isArray(images) ? images.filter(Boolean) : [];
++    const messageFiles = Array.isArray(files) ? files.filter(Boolean) : [];
++    const hasMedia = messageImages.length > 0 || messageFiles.length > 0;
++
+     if (!batch) {
+       if (!name) return { handled: false };
+       // Only starting a batch requires the plain-text command itself; /send and
+       // /cancel carry no content, so they must answer with their own state
+       // message instead of being refused as uncollectable content.
+-      if (!plainText && name === 'batch') {
++      if (!plainText && (name === 'batch' || name === 'hold')) {
+         return result('unsupported-content', t('批量输入命令仅支持纯文字，请移除图片、文件或引用消息后重试。'));
+       }
+       if (name === 'send') {
+@@ -97,22 +197,27 @@ export class BatchInputManager {
+       if (name === 'cancel') {
+         return result('no-batch', t('当前没有正在进行的批量输入。'));
+       }
+-      this.#batches.set(key, { phase: 'collecting', messages: [], token: null });
+-      return result('started', t(`已进入批量输入模式，最多可发送 {limit} 条文字。
++      const mode = name === 'hold' ? 'hold' : 'batch';
++      this.#batches.set(key, { phase: 'collecting', mode, entries: [], token: null });
++      return result('started', mode === 'hold'
++        ? t(`已进入暂存模式：接下来发送的文字、图片、文件都会先存起来，不会立即执行（最多 {limit} 项）。
++发送 /send 一次性提交，/cancel 取消。`, { limit: BATCH_INPUT_LIMIT })
++        : t(`已进入批量输入模式，最多可发送 {limit} 条文字。
+ 完成后发送 /send，取消请发送 /cancel。`, { limit: BATCH_INPUT_LIMIT }), {
+         count: 0,
+         limit: BATCH_INPUT_LIMIT,
++        mode,
+       });
+     }
+ 
+     // A command is never collected content: /send, /cancel and a repeated
+-    // /batch must keep working even when the message that carries them is a
+-    // quoted reply, an image caption or a file. Only the collected text itself
+-    // has to be plain.
+-    if (!plainText && batch.phase === 'collecting' && !name) {
++    // /batch or /hold must keep working even when the message that carries them
++    // is a quoted reply, an image caption or a file. Only the collected text
++    // itself has to be plain, and only in batch mode.
++    if (batch.mode === 'batch' && batch.phase === 'collecting' && !name && hasMedia) {
+       return result('unsupported-content', t(`批量输入模式目前仅支持文字，不支持图片、文件或引用消息，这条消息未收录。
+ 请继续发送文字，或使用 /send、/cancel。`), {
+-        count: batch.messages.length,
++        count: countEntries(batch.entries).count,
+         limit: BATCH_INPUT_LIMIT,
+       });
+     }
+@@ -125,79 +230,113 @@ export class BatchInputManager {
+         return result('submitting', t(`批量内容已经提交，无法取消。
+ 如需停止当前任务，请发送 /stop。`));
+       }
+-      if (name === 'batch') {
++      if (name === 'batch' || name === 'hold') {
+         return result('submitting', t('当前批次正在提交，请等待处理完成后再开启新批次。'));
+       }
+       return { handled: false };
+     }
+ 
+-    if (name === 'batch') {
+-      return result('status', progressMessage(batch.messages.length), {
+-        count: batch.messages.length,
++    if (name === 'batch' || name === 'hold') {
++      if (name === batch.mode) {
++        return result('status', progressMessage(batch.entries, batch.mode), {
++          count: countEntries(batch.entries).count,
++          limit: BATCH_INPUT_LIMIT,
++          mode: batch.mode,
++        });
++      }
++      return result('mode-active', t('当前正在{current}模式，请先发送 /send 提交或 /cancel 取消，再改用 /{requested}。', {
++        current: modeLabel(batch.mode),
++        requested: name,
++      }), {
++        count: countEntries(batch.entries).count,
+         limit: BATCH_INPUT_LIMIT,
++        mode: batch.mode,
+       });
+     }
+ 
+     if (name === 'cancel') {
+-      const count = batch.messages.length;
++      const detail = countEntries(batch.entries);
++      const previousMode = batch.mode;
+       this.#batches.delete(key);
+-      return result('cancelled', count === 0
+-        ? t('已取消批量输入。')
+-        : t('已取消批量输入，共丢弃 {count} 条消息。', { count }), { count });
++      return result('cancelled', detail.count === 0
++        ? t('已取消{current}。', { current: modeLabel(previousMode) })
++        : t('已取消{current}，共丢弃 {count} 项内容。', {
++          current: modeLabel(previousMode),
++          count: detail.count,
++        }), { count: detail.count });
+     }
+ 
+     if (name === 'send') {
+-      if (batch.messages.length === 0) {
++      const detail = countEntries(batch.entries);
++      if (detail.count === 0) {
+         return result('empty', t('当前批次还没有内容，请先发送文字，或使用 /cancel 取消。'), {
+           count: 0,
+         });
+       }
+-      const messages = Object.freeze([...batch.messages]);
++      const entries = Object.freeze([...batch.entries]);
+       const token = Object.freeze({});
+       batch.phase = 'submitting';
+       batch.token = token;
+       return result('submit', null, {
+         token,
+-        messages,
+-        prompt: submissionPrompt(messages),
+-        title: submissionTitle(messages),
+-        count: messages.length,
++        entries,
++        prompt: submissionPrompt(entries, batch.mode),
++        title: submissionTitle(entries),
++        images: entries.flatMap((entry) => (Array.isArray(entry.images) ? entry.images : [])),
++        files: entries.flatMap((entry) => (Array.isArray(entry.files) ? entry.files : [])),
++        count: detail.count,
++        mode: batch.mode,
+       });
+     }
+ 
+-    if (typeof text !== 'string') {
+-      return result('unsupported-content', t(`批量输入模式目前仅支持文字，不支持图片、文件或引用消息，这条消息未收录。
+-请继续发送文字，或使用 /send、/cancel。`), {
+-        count: batch.messages.length,
+-        limit: BATCH_INPUT_LIMIT,
+-      });
+-    }
++    const trimmed = typeof text === 'string' ? text.trim() : '';
++    if (!trimmed && !hasMedia) return { handled: false };
+ 
+-    if (text.trim().startsWith('/')) {
+-      return result('blocked-command', t('当前正在批量输入，请先发送 /send 提交或 /cancel 取消。'), {
+-        count: batch.messages.length,
++    if (trimmed.startsWith('/') && !hasMedia) {
++      return result('blocked-command', t('当前正在{current}，请先发送 /send 提交或 /cancel 取消。', {
++        current: modeLabel(batch.mode),
++      }), {
++        count: countEntries(batch.entries).count,
+         limit: BATCH_INPUT_LIMIT,
+       });
+     }
+ 
+-    if (batch.messages.length === BATCH_INPUT_LIMIT) {
++    const detail = countEntries(batch.entries);
++    if (detail.count === BATCH_INPUT_LIMIT) {
+       return result('full', t(`当前批次已满，这条消息未收录。
+ 请先发送 /send 提交或 /cancel 取消，然后重新发送这条消息。`), {
+         count: BATCH_INPUT_LIMIT,
+         limit: BATCH_INPUT_LIMIT,
+       });
+     }
++    if (detail.images + messageImages.length > MAX_TOTAL_IMAGES) {
++      return result('too-many-images', t('暂存中的图片总数不能超过 {limit} 张，这条消息未收录。', {
++        limit: MAX_TOTAL_IMAGES,
++      }), { count: detail.count, limit: BATCH_INPUT_LIMIT });
++    }
++    if (detail.files + messageFiles.length > MAX_TOTAL_FILES) {
++      return result('too-many-files', t('暂存中的文件总数不能超过 {limit} 个，这条消息未收录。', {
++        limit: MAX_TOTAL_FILES,
++      }), { count: detail.count, limit: BATCH_INPUT_LIMIT });
++    }
+ 
+-    batch.messages.push(text);
+-    const count = batch.messages.length;
+-    return result('collected', count === BATCH_INPUT_LIMIT
+-      ? t('已收集 {count}/{limit} 条，当前批次已满，请发送 /send 提交或 /cancel 取消。', {
+-        count,
+-        limit: BATCH_INPUT_LIMIT,
+-      })
+-      : null, {
+-      count,
++    batch.entries.push({
++      ...(trimmed ? { text: trimmed } : {}),
++      images: messageImages,
++      files: messageFiles,
++    });
++    const collected = countEntries(batch.entries);
++    return result('collected', batch.mode === 'hold'
++      ? progressMessage(batch.entries, batch.mode)
++      : (collected.count === BATCH_INPUT_LIMIT
++        ? t('已收集 {count}/{limit} 条，当前批次已满，请发送 /send 提交或 /cancel 取消。', {
++          count: collected.count,
++          limit: BATCH_INPUT_LIMIT,
++        })
++        : null), {
++      count: collected.count,
+       limit: BATCH_INPUT_LIMIT,
++      mode: batch.mode,
+     });
+   }
+ 
+@@ -206,7 +345,7 @@ export class BatchInputManager {
+     if (!batch || batch.phase !== 'submitting' || batch.token !== token) {
+       return Object.freeze({ completed: false });
+     }
+-    const count = batch.messages.length;
++    const count = countEntries(batch.entries).count;
+     this.#batches.delete(key);
+     return Object.freeze({ completed: true, count });
+   }
+@@ -218,11 +357,14 @@ export class BatchInputManager {
+     }
+     batch.phase = 'collecting';
+     batch.token = null;
+-    const count = batch.messages.length;
++    const count = countEntries(batch.entries).count;
+     return Object.freeze({
+       retained: true,
+       count,
+-      message: t(`批量内容提交失败，已保留 {count} 条消息。
++      message: batch.mode === 'hold'
++        ? t(`暂存内容提交失败，已保留 {count} 项。
++请再次发送 /send 重试或 /cancel 取消。`, { count })
++        : t(`批量内容提交失败，已保留 {count} 条消息。
+ 请再次发送 /send 重试或 /cancel 取消。`, { count }),
+     });
+   }
+diff --git a/src/channels/shared/command-catalog.mjs b/src/channels/shared/command-catalog.mjs
+index fa335e8..43bfe16 100644
+--- a/src/channels/shared/command-catalog.mjs
++++ b/src/channels/shared/command-catalog.mjs
+@@ -84,6 +84,9 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
+   defineCatalogCommand('batch', '开始批量输入（仅私聊）', [
+     '/batch  开始批量输入（仅私聊，最多 10 条文字）',
+   ], { privateOnly: true }),
++  defineCatalogCommand('hold', '暂存文字、图片和文件，稍后一次性提交（仅私聊）', [
++    '/hold  进入暂存模式（仅私聊，最多 10 项，可含图片和文件）',
++  ], { privateOnly: true }),
+   defineCatalogCommand('send', '提交当前批次', [
+     '/send  提交当前批次',
+   ], { privateOnly: true }),
+diff --git a/src/channels/shared/i18n-en/shared-c.mjs b/src/channels/shared/i18n-en/shared-c.mjs
+index f07a9dd..45caaf4 100644
+--- a/src/channels/shared/i18n-en/shared-c.mjs
++++ b/src/channels/shared/i18n-en/shared-c.mjs
+@@ -205,6 +205,38 @@ export default {
+     'Collected {count}/{limit} messages. The batch is full; send /send or /cancel.',
+   '批量内容提交失败，已保留 {count} 条消息。\n请再次发送 /send 重试或 /cancel 取消。':
+     'Batch submission failed; {count} messages were retained.\nSend /send to retry or /cancel to cancel.',
++
++  // hold mode (batch-input.mjs)
++  '/hold  进入暂存模式（仅私聊，最多 10 项，可含图片和文件）':
++    '/hold  Enter hold mode (direct messages only, up to 10 items, images and files allowed)',
++  '暂存文字、图片和文件，稍后一次性提交（仅私聊）':
++    'Hold text, images, and files to submit them together (direct messages only)',
++  '暂存': 'hold',
++  '文字 {texts} 条、图片 {images} 张、文件 {files} 个':
++    '{texts} text, {images} image(s), {files} file(s)',
++  '已进入暂存模式：接下来发送的文字、图片、文件都会先存起来，不会立即执行（最多 {limit} 项）。\n发送 /send 一次性提交，/cancel 取消。':
++    'Hold mode started. Text, images, and files are stored without running anything (up to {limit} items).\nSend /send to submit them together, or /cancel to cancel.',
++  '已暂存 {count}/{limit} 项（{detail}）。发送 /send 一次性提交，/cancel 取消。':
++    'Held {count}/{limit} item(s) ({detail}). Send /send to submit them together, or /cancel to cancel.',
++  '暂存已满（{count}/{limit} 项：{detail}）。请发送 /send 提交或 /cancel 取消。':
++    'Hold is full ({count}/{limit}: {detail}). Send /send to submit or /cancel to cancel.',
++  '以下是用户暂存后一次性提交的 {count} 项内容（{detail}），请按顺序作为同一次输入统一处理。':
++    'The user held {count} item(s) and submitted them together ({detail}). Process them in order as one input.',
++  '随本条消息附带的图片和文件见附件清单。':
++    'Images and files sent with this message are listed in the attachment manifest.',
++  '暂存中的图片总数不能超过 {limit} 张，这条消息未收录。':
++    'Held images cannot exceed {limit}; this message was not collected.',
++  '暂存中的文件总数不能超过 {limit} 个，这条消息未收录。':
++    'Held files cannot exceed {limit}; this message was not collected.',
++  '当前正在{current}模式，请先发送 /send 提交或 /cancel 取消，再改用 /{requested}。':
++    '{current} mode is active. Send /send or /cancel before switching to /{requested}.',
++  '已取消{current}。': '{current} cancelled.',
++  '已取消{current}，共丢弃 {count} 项内容。':
++    '{current} cancelled; {count} item(s) were discarded.',
++  '当前正在{current}，请先发送 /send 提交或 /cancel 取消。':
++    '{current} is active. Send /send to submit or /cancel to cancel first.',
++  '暂存内容提交失败，已保留 {count} 项。\n请再次发送 /send 重试或 /cancel 取消。':
++    'Hold submission failed; {count} item(s) were retained.\nSend /send to retry or /cancel to cancel.',
+   '你可以发送普通消息，但没有执行命令的权限。':
+     'You can send regular messages, but you do not have permission to run commands.',
+ };
+diff --git a/src/channels/shared/text-harness-bridge.mjs b/src/channels/shared/text-harness-bridge.mjs
+index ffb2f5f..838c35b 100644
+--- a/src/channels/shared/text-harness-bridge.mjs
++++ b/src/channels/shared/text-harness-bridge.mjs
+@@ -388,7 +388,7 @@ export class TextHarnessBridge {
+       );
+     }
+     if (batchCommand && normalized.kind === 'direct') {
+-      const exactBatch = /^\/batch$/iu.test(text);
++      const exactBatch = /^\/(?:batch|hold)$/iu.test(text);
+       if (exactBatch && (
+         this.#queues.has(key)
+         || Boolean(pending)
+@@ -402,17 +402,20 @@ export class TextHarnessBridge {
+           && !hasInboundImages(normalized)
+           && !hasInboundFiles(normalized)
+           && !hasReplyReference(normalized),
++        images: Array.isArray(normalized.images) ? normalized.images : [],
++        files: Array.isArray(normalized.files) ? normalized.files : [],
+       });
+       if (batch.handled) {
+         if (batch.kind === 'submit') {
+           return this.#enqueueMessage({
+             ...normalized,
+             content: batch.prompt,
+-            // The submission is exactly the collected text; a quote or an
+-            // attachment on the command itself is not part of it.
++            // The submission is the collected text plus whatever images and
++            // files were staged with it; a quote or an attachment on the /send
++            // command itself is not part of it.
+             replyTo: null,
+-            images: [],
+-            files: [],
++            images: batch.images ?? [],
++            files: batch.files ?? [],
+             batchSubmission: { token: batch.token, title: batch.title },
+           }, messageId, senderId, key);
+         }
+@@ -426,8 +429,20 @@ export class TextHarnessBridge {
+           && !hasInboundImages(normalized)
+           && !hasInboundFiles(normalized)
+           && !hasReplyReference(normalized),
++        images: Array.isArray(normalized.images) ? normalized.images : [],
++        files: Array.isArray(normalized.files) ? normalized.files : [],
+       });
+       if (batch.handled) {
++        if (batch.kind === 'submit') {
++          return this.#enqueueMessage({
++            ...normalized,
++            content: batch.prompt,
++            replyTo: null,
++            images: batch.images ?? [],
++            files: batch.files ?? [],
++            batchSubmission: { token: batch.token, title: batch.title },
++          }, messageId, senderId, key);
++        }
+         return this.#finishLocalMessage(normalized, messageId, batch.message);
+       }
+     }
+@@ -1024,6 +1039,19 @@ export class TextHarnessBridge {
+     return this.#bot.sendText(target, text);
+   }
+ 
++  sendProactiveFile(target, file, { signal } = {}) {
++    signal?.throwIfAborted();
++    if (file?.mediaType?.startsWith('image/') && typeof this.#bot.sendImage === 'function') {
++      return this.#bot.sendImage(target, file);
++    }
++    if (typeof this.#bot.sendFile !== 'function') {
++      const error = new Error('This channel cannot send files proactively');
++      error.code = 'capability-unavailable';
++      throw error;
++    }
++    return this.#bot.sendFile(target, file);
++  }
++
+   async #deliverArtifacts(target, replyTo, artifacts = [], baseReceipt) {
+     const delivery = await deliverOutboundArtifacts({
+       artifacts,
+diff --git a/src/channels/shared/token-bot-controller.mjs b/src/channels/shared/token-bot-controller.mjs
+index dd6e243..84ed562 100644
+--- a/src/channels/shared/token-bot-controller.mjs
++++ b/src/channels/shared/token-bot-controller.mjs
+@@ -247,6 +247,23 @@ export class TokenBotController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('{label}机器人尚未连接', {
++          label: this.#descriptor.label,
++        }));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error(`Unknown ${this.#descriptor.label} bot`);
+diff --git a/src/channels/slack/slack-controller.mjs b/src/channels/slack/slack-controller.mjs
+index e857ecb..2f6a7ba 100644
+--- a/src/channels/slack/slack-controller.mjs
++++ b/src/channels/slack/slack-controller.mjs
+@@ -207,6 +207,21 @@ export class SlackController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown Slack bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('Slack机器人尚未连接'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Slack bot');
+diff --git a/src/channels/slack/slack-runtime.mjs b/src/channels/slack/slack-runtime.mjs
+index 14b93a0..71c7775 100644
+--- a/src/channels/slack/slack-runtime.mjs
++++ b/src/channels/slack/slack-runtime.mjs
+@@ -539,6 +539,30 @@ export class SlackRuntime {
+     }, text, options);
+   }
+ 
++  async sendProactiveFile(target, file, options = {}) {
++    if (!this.#status.ready || !this.#bridge) {
++      const error = new Error('Slack bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const channelId = typeof target?.route?.channelId === 'string'
++      ? target.route.channelId.trim() : '';
++    const threadTs = typeof target?.route?.threadTs === 'string'
++      ? target.route.threadTs.trim() : '';
++    if (!channelId
++      || (target?.kind !== 'conversation' && target?.kind !== 'thread')
++      || (target.kind === 'thread' && !threadTs)
++      || (target.kind === 'conversation' && threadTs)) {
++      const error = new TypeError('Invalid Slack proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    return this.#bridge.sendProactiveFile({
++      channelId,
++      ...(threadTs ? { threadTs } : {}),
++    }, file, options);
++  }
++
+   async start() {
+     if (this.#status.ready && this.#socket) return this.status;
+     if (this.#starting) return this.#starting;
+diff --git a/src/channels/telegram/telegram-runtime.mjs b/src/channels/telegram/telegram-runtime.mjs
+index 0f3fbdc..5c46014 100644
+--- a/src/channels/telegram/telegram-runtime.mjs
++++ b/src/channels/telegram/telegram-runtime.mjs
+@@ -1206,6 +1206,30 @@ export class TelegramRuntime {
+     }, text, options);
+   }
+ 
++  async sendProactiveFile(target, file, options = {}) {
++    if (!this.#status.ready || !this.#bridge) {
++      const error = new Error('Telegram bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const chatIdText = typeof target?.route?.chatId === 'string'
++      ? target.route.chatId.trim() : '';
++    const chatId = Number(chatIdText);
++    const messageThreadId = target?.route?.messageThreadId;
++    if (!/^-?\d+$/.test(chatIdText) || !Number.isSafeInteger(chatId)
++      || (target?.kind !== 'chat' && target?.kind !== 'topic')
++      || (target.kind === 'topic' && (!Number.isSafeInteger(messageThreadId) || messageThreadId <= 0))
++      || (target.kind === 'chat' && messageThreadId !== undefined)) {
++      const error = new TypeError('Invalid Telegram proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    return this.#bridge.sendProactiveFile({
++      chatId,
++      ...(messageThreadId === undefined ? {} : { messageThreadId }),
++    }, file, options);
++  }
++
+   async start() {
+     if (this.#status.ready && this.#pollTask) return this.status;
+     if (this.#starting) return this.#starting;
+diff --git a/src/channels/wecom/wecom-bridge.mjs b/src/channels/wecom/wecom-bridge.mjs
+index 08aabf0..82d8de3 100644
+--- a/src/channels/wecom/wecom-bridge.mjs
++++ b/src/channels/wecom/wecom-bridge.mjs
+@@ -541,7 +541,7 @@ export function sendWecomImage(client, chatId, file, options) {
+   return sendWecomMedia(client, chatId, file, 'image', options);
+ }
+ 
+-function sendWecomFile(client, chatId, file, options) {
++export function sendWecomFile(client, chatId, file, options) {
+   return sendWecomMedia(client, chatId, file, 'file', options);
+ }
+ 
+diff --git a/src/channels/wecom/wecom-controller.mjs b/src/channels/wecom/wecom-controller.mjs
+index 70c8b86..a14e1f5 100644
+--- a/src/channels/wecom/wecom-controller.mjs
++++ b/src/channels/wecom/wecom-controller.mjs
+@@ -281,6 +281,21 @@ export class WecomController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown Enterprise WeChat bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('企业微信连接当前离线'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Enterprise WeChat bot');
+diff --git a/src/channels/wecom/wecom-runtime.mjs b/src/channels/wecom/wecom-runtime.mjs
+index d4f43f5..23434bb 100644
+--- a/src/channels/wecom/wecom-runtime.mjs
++++ b/src/channels/wecom/wecom-runtime.mjs
+@@ -1,7 +1,7 @@
+ import { createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
+ import { WSAuthFailureError, WSClient, WSReconnectExhaustedError } from '@wecom/aibot-node-sdk';
+ 
+-import { createWecomBridgeStatus, WecomHarnessBridge } from './wecom-bridge.mjs';
++import { createWecomBridgeStatus, sendWecomFile, WecomHarnessBridge } from './wecom-bridge.mjs';
+ import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
+ import { t } from '../shared/i18n.mjs';
+ import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
+@@ -241,6 +241,23 @@ export class WecomRuntime {
+     }, options);
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const chatId = typeof target?.route?.chatId === 'string'
++      ? target.route.chatId.trim() : '';
++    if ((target?.kind !== 'user' && target?.kind !== 'group') || !chatId) {
++      const error = new TypeError('Invalid Enterprise WeChat proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#status.ready || !this.#client) {
++      const error = new Error('Enterprise WeChat runtime is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    signal?.throwIfAborted();
++    return await sendWecomFile(this.#client, chatId, file, { signal });
++  }
++
+   async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
+     const chatId = typeof target?.route?.chatId === 'string'
+       ? target.route.chatId.trim() : '';
+diff --git a/src/channels/wecom-app/wecom-app-controller.mjs b/src/channels/wecom-app/wecom-app-controller.mjs
+index 1a08350..96d7250 100644
+--- a/src/channels/wecom-app/wecom-app-controller.mjs
++++ b/src/channels/wecom-app/wecom-app-controller.mjs
+@@ -290,6 +290,21 @@ export class WecomAppController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown Enterprise WeChat app bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('企业微信应用当前离线'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Enterprise WeChat app bot');
+diff --git a/src/channels/wecom-app/wecom-app-runtime.mjs b/src/channels/wecom-app/wecom-app-runtime.mjs
+index de41787..e20837f 100644
+--- a/src/channels/wecom-app/wecom-app-runtime.mjs
++++ b/src/channels/wecom-app/wecom-app-runtime.mjs
+@@ -224,6 +224,28 @@ export class WecomAppRuntime {
+     return { sent: true };
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const chatId = typeof target?.route?.chatId === 'string' ? target.route.chatId.trim() : '';
++    if (target?.kind !== 'user' || !chatId) {
++      const error = new TypeError('Invalid Enterprise WeChat app proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#started || !this.#api) {
++      const error = new WecomAppError('bot-not-connected', 'Enterprise WeChat app runtime is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    signal?.throwIfAborted();
++    return await this.#api.sendArtifactFile({
++      userId: chatId,
++      kind: typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/') ? 'image' : 'file',
++      bytes: file.bytes,
++      filename: file.fileName,
++      signal,
++    });
++  }
++
+   #signal() {
+     // Each start() gets a fresh controller; stop() aborts the latest one.
+     if (this.#controller.signal.aborted) this.#controller = new AbortController();
+diff --git a/src/channels/weixin/weixin-bridge.mjs b/src/channels/weixin/weixin-bridge.mjs
+index 40f781a..60fa031 100644
+--- a/src/channels/weixin/weixin-bridge.mjs
++++ b/src/channels/weixin/weixin-bridge.mjs
+@@ -235,6 +235,37 @@ export function weixinInboundMessage(message, api, state, { loadReplyContent } =
+   };
+ }
+ 
++/**
++ * Start downloading staged images at collection time.
++ *
++ * iLink media links are short-lived, and a staged submission may be sent long
++ * after the image arrived. Kicking off the download now and handing the
++ * collector a source that awaits the same promise keeps the bytes without
++ * blocking the receipt.
++ */
++function prefetchImageSources(sources, signal) {
++  if (!Array.isArray(sources)) return [];
++  return sources.map((source) => {
++    if (!source || source.data !== undefined || typeof source.load !== 'function') return source;
++    let download;
++    try {
++      download = Promise.resolve(source.load({ signal }));
++    } catch (error) {
++      download = Promise.reject(error);
++    }
++    download.catch(() => undefined);
++    return {
++      ...source,
++      async load({ signal: loadSignal } = {}) {
++        loadSignal?.throwIfAborted();
++        const result = await download;
++        loadSignal?.throwIfAborted();
++        return result;
++      },
++    };
++  });
++}
++
+ function hasWeixinImageItems(message) {
+   return Array.isArray(message?.item_list)
+     && message.item_list.some((item) => item?.image_item && typeof item.image_item === 'object');
+@@ -434,7 +465,13 @@ export class WeixinHarnessBridge {
+     const batchCommand = isBatchInputCommand(commandText);
+     const batchStatus = this.#batchInputs.status(key);
+     if (batchCommand || batchStatus.phase === 'collecting') {
+-      const exactBatchStart = /^\/batch$/iu.test(commandText);
++      const exactBatchStart = /^\/(?:batch|hold)$/iu.test(commandText);
++      // Media travels with the message on the text channels only because the
++      // shared bridge reads it from the normalized message; the WeChat bridge
++      // normalizes raw iLink items itself, so hand the same sources to the
++      // collector or a staged image would dispatch on its own.
++      const inbound = prefetchInboundFiles(this.#inboundMessage(message), { signal: this.#signal });
++      const stagedImages = prefetchImageSources(inbound.images, this.#signal);
+       const result = exactBatchStart
+         && batchStatus.phase === 'idle'
+         && (this.#queues.has(key) || pending || this.#approvals.hasPending(key))
+@@ -442,13 +479,28 @@ export class WeixinHarnessBridge {
+         : this.#batchInputs.handle(key, commandText, {
+             plainText: isNativeWeixinText(message)
+               && !extractWeixinReplyReference(message),
++            images: stagedImages,
++            files: Array.isArray(inbound.files) ? inbound.files : [],
+           });
+       if (result.handled) {
+         if (result.kind === 'submit') {
+           return this.#enqueueMessage({
+             ...message,
+             item_list: [{ type: 1, text_item: { text: result.prompt } }],
+-          }, messageId, key, { batchSubmission: result });
++          }, messageId, key, {
++            batchSubmission: result,
++            // The submission is the staged prompt plus the images and files
++            // collected with it; the /send command's own payload is ignored.
++            preparedMessage: {
++              ...inbound,
++              content: result.prompt,
++              images: result.images ?? [],
++              files: result.files ?? [],
++              // The submission is the staged content; a quote on the /send
++              // command itself is not part of it.
++              replyTo: undefined,
++            },
++          });
+         }
+         return this.#finishBatchResult(
+           message,
+@@ -567,8 +619,9 @@ export class WeixinHarnessBridge {
+     releaseMessageId = true,
+     alreadyRecorded = false,
+     batchSubmission = null,
++    preparedMessage: stagedMessage = null,
+   } = {}) {
+-    const preparedMessage = prefetchInboundFiles(
++    const preparedMessage = stagedMessage ?? prefetchInboundFiles(
+       this.#inboundMessage(message),
+       { signal: this.#signal },
+     );
+diff --git a/src/channels/weixin/weixin-controller.mjs b/src/channels/weixin/weixin-controller.mjs
+index 9bff9ff..a79c06d 100644
+--- a/src/channels/weixin/weixin-controller.mjs
++++ b/src/channels/weixin/weixin-controller.mjs
+@@ -289,6 +289,21 @@ export class WeixinController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown Weixin account');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('微信连接当前离线'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Weixin account');
+diff --git a/src/channels/weixin/weixin-runtime.mjs b/src/channels/weixin/weixin-runtime.mjs
+index fd8a08f..dd9ab18 100644
+--- a/src/channels/weixin/weixin-runtime.mjs
++++ b/src/channels/weixin/weixin-runtime.mjs
+@@ -430,4 +430,35 @@ export class WeixinRuntime {
+     }
+     return { sent: true };
+   }
++
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const toUserId = typeof target?.route?.toUserId === 'string'
++      ? target.route.toUserId.trim() : '';
++    if (target?.kind !== 'user' || !toUserId) {
++      const error = new TypeError('Invalid Weixin proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#status.ready || !this.#abortController || !this.#api) {
++      const error = new Error('Weixin runtime is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    const sendSignal = signal ?? this.#abortController.signal;
++    sendSignal.throwIfAborted();
++    const image = typeof file?.mediaType === 'string' && file.mediaType.startsWith('image/');
++    const method = image && typeof this.#api.sendImage === 'function' ? 'sendImage' : 'sendFile';
++    if (typeof this.#api[method] !== 'function') {
++      const error = new Error('Weixin cannot send this file type');
++      error.code = 'capability-unavailable';
++      throw error;
++    }
++    return await this.#api[method]({
++      baseUrl: this.#config.baseUrl,
++      token: this.#token,
++      toUserId,
++      file,
++      signal: sendSignal,
++    });
++  }
+ }
+diff --git a/src/channels/whatsapp/whatsapp-controller.mjs b/src/channels/whatsapp/whatsapp-controller.mjs
+index 1379636..b426e49 100644
+--- a/src/channels/whatsapp/whatsapp-controller.mjs
++++ b/src/channels/whatsapp/whatsapp-controller.mjs
+@@ -248,6 +248,21 @@ export class WhatsappController {
+     });
+   }
+ 
++  async sendProactiveFile(botId, target, file, options = {}) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown WhatsApp bot');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendProactiveFile !== 'function') {
++        const error = new Error(t('WhatsApp机器人尚未连接'));
++        error.code = 'bot-not-connected';
++        throw error;
++      }
++      return runtime.sendProactiveFile(target, file, options);
++    });
++  }
++
++
+   async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown WhatsApp bot');
+diff --git a/src/channels/whatsapp/whatsapp-runtime.mjs b/src/channels/whatsapp/whatsapp-runtime.mjs
+index 21194de..f79e254 100644
+--- a/src/channels/whatsapp/whatsapp-runtime.mjs
++++ b/src/channels/whatsapp/whatsapp-runtime.mjs
+@@ -930,6 +930,25 @@ export class WhatsappRuntime {
+     return this.#client.sendText({ jid }, text);
+   }
+ 
++  async sendProactiveFile(target, file, { signal } = {}) {
++    const jid = typeof target?.route?.jid === 'string' ? target.route.jid.trim() : '';
++    const validUser = target?.kind === 'user'
++      && /^[^@\s]+@(s\.whatsapp\.net|lid)$/.test(jid);
++    const validGroup = target?.kind === 'group' && /^[^@\s]+@g\.us$/.test(jid);
++    if (!validUser && !validGroup) {
++      const error = new TypeError('Invalid WhatsApp proactive delivery target');
++      error.code = 'invalid-target';
++      throw error;
++    }
++    if (!this.#status.ready || !this.#client) {
++      const error = new Error('WhatsApp bot is not connected');
++      error.code = 'bot-not-connected';
++      throw error;
++    }
++    signal?.throwIfAborted();
++    return this.#client.sendFile({ jid }, file);
++  }
++
+   async stop() {
+     const session = this.#session;
+     const client = this.#client;

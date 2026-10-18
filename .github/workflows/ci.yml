@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Apply patch to a pristine 5.0.2 package
+        run: |
+          curl -sSL https://registry.npmjs.org/@xmanrui/dsh-im/-/dsh-im-5.0.2.tgz -o pkg.tgz
+          mkdir -p pkg && tar xzf pkg.tgz -C pkg --strip-components=1
+          patch -p1 -d pkg < patches/dsh-im-5.0.2.patch
+      - name: Syntax-check every patched ESM file
+        run: |
+          files=$(grep '^+++ b/' patches/dsh-im-5.0.2.patch | sed 's|^+++ b/||' | grep '\.mjs$' || true)
+          for f in $files; do node --check "pkg/$f"; done
+      - name: Verify shipped bundle checksum
+        run: cd dist && sha256sum -c SHA256SUMS
