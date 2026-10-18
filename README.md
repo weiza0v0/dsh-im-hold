@@ -110,6 +110,11 @@ DSH_IM_PKG_DIR="$HOME/.dsh/profiles/web/node_modules/@xmanrui/dsh-im" node build
 - 文件接口**没有鉴权、也没有 CORS**，只应在本机使用；
 - 接口接受任意本地绝对路径（≤ 30 MB），不可信环境请自行加目录白名单或不要暴露 3080。
 
+## 配套工具
+
+想在 agent 里直接调用「发到微信」而不是手写 curl，可以配合
+[weiza0v0/dsh-im-tools](https://github.com/weiza0v0/dsh-im-tools)（提供 `im_send_text` / `im_send_file` 工具）。
+
 ## 许可
 
 MIT。修改与分发基于 [`@xmanrui/dsh-im`](https://github.com/xmanrui/dsh-im)（MIT），保留其版权声明。
