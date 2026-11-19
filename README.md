@@ -1,3 +1,18 @@
+> ## ⚠️ 状态：已归档，不再维护（2026-11-20）
+>
+> 上游 `@xmanrui/dsh-im` 到 **5.10.0** 依然只提供「主动投递文字」，没有 `sendProactiveFile`，
+> 也没有 `/api/dsh-im/delivery/files`。但这个补丁的做法（改 36 个源文件 + 重建 9 MB 的
+> `lib/index.js`）意味着**每次上游升级都要重新 rebase 一遍**，维护成本远高于收益。
+>
+> 现在改用另一条路：把文件投递从 dsh-im 里**搬出来**，由
+> [weiza0v0/dsh-im-tools](https://github.com/weiza0v0/dsh-im-tools) 直连目标平台的开放 API
+> （v0.2.0 起内置飞书直连：`tenant_access_token` → `im/v1/files|images` → `im/v1/messages`）。
+> 这样 dsh-im 可以跟着上游随便升，文件投递不会跟着坏，也不用再维护任何源码补丁。
+>
+> **本仓库因此归档**：不再跟进上游版本，不再发布新 patch。下面的内容保留作为历史参考
+> （想看「/hold 图文暂存」和「delivery/files」当年是怎么在 dsh-im 里实现的，仍然有用）。
+> 本机（5.4.0 基线）曾把该补丁 rebase 到 5.4.0 并跑通，那份改动只在本机归档，未发布到这里。
+
 # dsh-im-hold
 
 `@xmanrui/dsh-im` 的本地补丁：**`/hold` 图文暂存** + **主动投递文件接口**。
